@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#0f172a">
+<title>Bayazit Mogel-Check</title>
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https://images.openfoodfacts.org https://static.openfoodfacts.org; connect-src https://world.openfoodfacts.org https://prices.openfoodfacts.org; media-src 'self' blob: mediastream:; base-uri 'none'; form-action 'none'">
+<meta name="referrer" content="no-referrer">
+<script src="vendor/html5-qrcode.min.js"></script>
+<style>
+  :root{--bg:#0f172a;--card:#1e293b;--line:#334155;--text:#e2e8f0;--muted:#94a3b8;--acc:#38bdf8;--red:#f87171;--green:#4ade80;--yellow:#facc15}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;font-size:16px;line-height:1.45}
+  header{padding:16px;text-align:center;border-bottom:1px solid var(--line)}
+  header h1{margin:0;font-size:1.3rem}
+  header p{margin:4px 0 0;color:var(--muted);font-size:.85rem}
+  main{max-width:720px;margin:0 auto;padding:12px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px;margin-bottom:12px}
+  .card h2{font-size:1.05rem;margin:0 0 10px}
+  button{background:var(--acc);color:#0f172a;border:0;border-radius:10px;padding:12px 14px;font-size:1rem;font-weight:600;cursor:pointer}
+  button.sec{background:transparent;color:var(--acc);border:1px solid var(--acc)}
+  button:disabled{opacity:.5}
+  input{background:#0b1220;color:var(--text);border:1px solid var(--line);border-radius:10px;padding:11px;font-size:1rem;width:100%}
+  .row{display:flex;gap:8px;align-items:center}
+  .row > *{flex:1}
+  .row > button{flex:0 0 auto}
+  #reader{width:100%;margin-top:10px;border-radius:10px;overflow:hidden}
+  .muted{color:var(--muted);font-size:.88rem}
+  .prod{display:flex;gap:12px;align-items:flex-start}
+  .prod img{width:90px;height:90px;object-fit:contain;background:#fff;border-radius:10px}
+  .prod h3{margin:0 0 4px;font-size:1.1rem}
+  .badge{display:inline-block;padding:2px 8px;border-radius:999px;font-size:.8rem;font-weight:700}
+  .b-red{background:rgba(248,113,113,.15);color:var(--red)}
+  .b-green{background:rgba(74,222,128,.15);color:var(--green)}
+  .b-gray{background:rgba(148,163,184,.15);color:var(--muted)}
+  .alert{border-left:4px solid var(--red);background:rgba(248,113,113,.08);padding:10px 12px;border-radius:8px;margin-bottom:8px}
+  .ok{border-left:4px solid var(--green);background:rgba(74,222,128,.08);padding:10px 12px;border-radius:8px}
+  .tl{list-style:none;margin:0;padding:0}
+  .tl li{display:flex;justify-content:space-between;gap:8px;padding:9px 0;border-bottom:1px solid var(--line)}
+  .tl li:last-child{border-bottom:0}
+  table{width:100%;border-collapse:collapse;font-size:.92rem}
+  td,th{padding:7px 4px;border-bottom:1px solid var(--line);text-align:left}
+  td.r,th.r{text-align:right}
+  .ns{display:inline-block;width:30px;height:30px;line-height:30px;text-align:center;border-radius:8px;font-weight:800;color:#fff}
+  .tag{display:inline-block;background:#0b1220;border:1px solid var(--line);border-radius:8px;padding:3px 8px;margin:2px;font-size:.85rem}
+  .recent button{width:100%;text-align:left;background:#0b1220;color:var(--text);border:1px solid var(--line);margin-bottom:6px;font-weight:500}
+  .progress{height:6px;background:#0b1220;border-radius:6px;overflow:hidden;margin:8px 0}
+  .progress div{height:100%;background:var(--acc);width:0;transition:width .2s}
+  a{color:var(--acc)}
+  .hidden{display:none}
+  .small{font-size:.8rem}
+</style>
+</head>
+<body>
+<header>
+  <h1>🔍 Bayazit Mogel-Check</h1>
+  <p>Füllmenge, Preis und Inhaltsstoffe im Verlauf</p>
+</header>
+<main>
+
+  <section class="card">
+    <h2>Produkt suchen</h2>
+    <div class="row">
+      <input id="code" inputmode="numeric" placeholder="Barcode eingeben (z. B. 4000417025005)">
+      <button id="btnSearch">Suchen</button>
+    </div>
+    <div class="row" style="margin-top:8px">
+      <button id="btnScan" class="sec" style="flex:1">📷 Barcode scannen</button>
+    </div>
+    <div id="reader" class="hidden"></div>
+    <p id="scanMsg" class="muted"></p>
+  </section>
+
+  <div id="result"></div>
+
+  <section class="card" id="recentCard">
+    <h2>Zuletzt angesehen</h2>
+    <div id="recent" class="recent"><p class="muted">Noch nichts gescannt.</p></div>
+  </section>
+
+  <p class="muted small" style="text-align:center">
+    Daten: <a href="https://de.openfoodfacts.org" target="_blank" rel="noopener">Open Food Facts</a> und
+    <a href="https://prices.openfoodfacts.org" target="_blank" rel="noopener">Open Prices</a> (Lizenz ODbL).
+    Eigene Preise werden nur auf diesem Gerät gespeichert.
+  </p>
+</main>
+
+<script src="app.js"></script>
+
+</body>
+</html>
