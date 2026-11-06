@@ -35,50 +35,85 @@ async function getProduct(code){
   return j.status === 1 ? j.product : null;
 }
 
-/* Alte Versionen eines Produkts abrufen (mit Zwischenspeicher, alte Versionen ändern sich nie) */
+/* Alte Versionen eines Produkts abrufen (mit Zwischenspeicher, alte Versionen ändern sich nie).
+   Bei Fehlern (Datenbank ausgelastet) bis zu 3 Versuche mit Pause. */
+const sleep = ms => new Promise(r => setTimeout(r, ms));
 async function getRev(code, rev){
   const cache = load("rev_" + code, {});
-  if(cache[rev]) return cache[rev];
-  const r = await fetch(`${OFF}/api/v2/product/${code}?rev=${rev}&fields=quantity,last_modified_t`);
-  if(!r.ok) return null;
-  const j = await r.json();
-  if(!j.product) return null;
-  const v = {q: j.product.quantity || null, t: j.product.last_modified_t || null};
-  cache[rev] = v; save("rev_" + code, cache);
-  return v;
+  if(cache && cache[rev]) return cache[rev];
+  for(let attempt = 1; attempt <= 3; attempt++){
+    try{
+      const r = await fetch(`${OFF}/api/v2/product/${code}?rev=${rev}&fields=quantity,last_modified_t`);
+      if(r.status === 404){ const v = {q:null, t:null}; cache[rev] = v; save("rev_" + code, cache); return v; }
+      if(r.ok){
+        const j = await r.json();
+        const v = {q: j.product?.quantity || null, t: j.product?.last_modified_t || null};
+        const c2 = load("rev_" + code, {}) || {}; c2[rev] = v; save("rev_" + code, c2);
+        return v;
+      }
+    }catch(e){}
+    await sleep(900 * attempt);
+  }
+  return null; // endgültig fehlgeschlagen, wird NICHT gespeichert
 }
 
-/* Füllmengen-Verlauf: Stichproben über alle Versionen, dann genaue Suche, wo sich die Menge ändert */
-async function quantityHistory(code, maxRev, onProgress){
-  if(!maxRev || maxRev < 2) return [];
-  const revs = {};
-  let calls = 0; const LIMIT = 70;
-  const fetchRev = async n => { if(revs[n] !== undefined) return revs[n]; if(calls >= LIMIT){ revs[n] = null; return null; } calls++; revs[n] = await getRev(code, n).catch(() => null); onProgress && onProgress(Math.min(calls / 30, 1)); return revs[n]; };
+/* Nur echte Mengen mit Einheit zählen ("185 g", "1,5 l"). Einträge wie "185", "2pcs" sind Tippfehler in der Datenbank. */
+const goodKey = q => { const p = parseQty(q); return p ? Math.round(p.amount*10)/10 + p.unit : null; };
 
-  const N = Math.min(16, maxRev);
-  const sample = [...new Set(Array.from({length:N}, (_, i) => Math.round(1 + i * (maxRev - 1) / (N - 1))))];
-  for(let i = 0; i < sample.length; i += 4) await Promise.all(sample.slice(i, i+4).map(fetchRev));
+const HIST_VER = 2;
+async function quantityHistory(code, p, onProgress){
+  const maxRev = Math.min(Math.max(parseInt(p.rev, 10) || 0, 0), 5000);
+  if(maxRev < 2) return {seg:[], complete:true};
+  const saved = load("hist_" + code, null);
+  if(saved && saved.v === HIST_VER && saved.maxRev === maxRev) return saved.res;
 
-  for(let i = 0; i < sample.length - 1; i++){
-    let a = sample[i], b = sample[i+1];
-    if(!revs[a] || !revs[b]) continue;
-    if(qtyKey(revs[a].q) === qtyKey(revs[b].q)) continue;
-    while(b - a > 1 && calls < LIMIT){
-      const mid = Math.floor((a + b) / 2);
-      const v = await fetchRev(mid);
-      if(!v) break;
-      if(qtyKey(v.q) === qtyKey(revs[a].q)) a = mid; else b = mid;
+  const revs = {}; let failed = 0, done = 0;
+  revs[maxRev] = {q: p.quantity || null, t: p.last_modified_t || null};
+  const want = new Set();
+  const fetchRev = async n => {
+    if(revs[n] !== undefined) return revs[n];
+    revs[n] = await getRev(code, n);
+    if(revs[n] === null) failed++;
+    done++; onProgress && onProgress(Math.min(done / Math.max(want.size, 1), 1));
+    return revs[n];
+  };
+  const runAll = async list => { for(let i = 0; i < list.length; i += 3) await Promise.all(list.slice(i, i+3).map(fetchRev)); };
+
+  if(maxRev <= 80){
+    // Wenige Versionen: alle abrufen -> vollständig und immer gleich
+    const list = []; for(let n = 1; n < maxRev; n++){ list.push(n); want.add(n); }
+    await runAll(list);
+  } else {
+    // Viele Versionen: 40 Stichproben, dann genaue Suche zwischen unterschiedlichen Mengen
+    const N = 40;
+    const sample = [...new Set(Array.from({length:N}, (_, i) => Math.round(1 + i * (maxRev - 1) / (N - 1))))];
+    sample.forEach(n => want.add(n));
+    await runAll(sample);
+    const known = sample.filter(n => revs[n] && goodKey(revs[n].q));
+    for(let i = 0; i < known.length - 1; i++){
+      let a = known[i], b = known[i+1];
+      if(goodKey(revs[a].q) === goodKey(revs[b].q)) continue;
+      let guard = 0;
+      while(b - a > 1 && guard++ < 20){
+        const mid = Math.floor((a + b) / 2); want.add(mid);
+        const v = await fetchRev(mid);
+        const k = v ? goodKey(v.q) : null;
+        if(k === null){ a = mid; continue; }          // unbrauchbarer Eintrag: weiter eingrenzen
+        if(k === goodKey(revs[a].q)) a = mid; else b = mid;
+      }
     }
   }
   onProgress && onProgress(1);
 
-  const list = Object.keys(revs).map(Number).sort((x,y) => x-y).filter(n => revs[n] && revs[n].q);
+  const list = Object.keys(revs).map(Number).sort((x,y) => x-y).filter(n => revs[n] && goodKey(revs[n].q));
   const seg = [];
   for(const n of list){
-    const k = qtyKey(revs[n].q);
-    if(!seg.length || seg[seg.length-1].key !== k) seg.push({key:k, raw:revs[n].q, p:parseQty(revs[n].q), from:revs[n].t ? revs[n].t*1000 : null, rev:n});
+    const k = goodKey(revs[n].q);
+    if(!seg.length || seg[seg.length-1].key !== k) seg.push({key:k, p:parseQty(revs[n].q), from:revs[n].t ? revs[n].t*1000 : null, rev:n});
   }
-  return seg;
+  const res = {seg, complete: failed === 0};
+  if(res.complete) save("hist_" + code, {v:HIST_VER, maxRev, res});
+  return res;
 }
 
 /* ---------- Open Prices ---------- */
@@ -109,13 +144,15 @@ function qtyAt(seg, date, fallback){
   return q;
 }
 
+let showToken = 0;
 async function show(code){
+  const my = ++showToken;
   code = String(code).replace(/\D/g, "");
   if(code.length < 8 || code.length > 14){ $("#result").innerHTML = `<div class="card"><p>Bitte einen gültigen Barcode eingeben (8–14 Ziffern).</p></div>`; return; }
   $("#code").value = code;
   $("#result").innerHTML = `<div class="card"><p>Suche Produkt …</p></div>`;
   let p;
-  try{ p = await getProduct(code); }
+  try{ p = await getProduct(code); if(my !== showToken) return; }
   catch(e){ $("#result").innerHTML = `<div class="card"><p>⚠️ ${esc(e.message)}</p></div>`; return; }
   if(!p){
     $("#result").innerHTML = `<div class="card"><h2>Nicht gefunden</h2><p>Der Barcode <b>${esc(code)}</b> ist noch nicht in der Datenbank.</p>
@@ -138,6 +175,7 @@ async function show(code){
         <div class="muted">${esc(p.brands || "")}</div>
         <div style="margin-top:6px">Füllmenge jetzt: <b>${esc(p.quantity || "unbekannt")}</b></div>
         ${ns ? `<div style="margin-top:6px">Nutri-Score <span class="ns" style="background:${NS_COL[ns]}">${ns.toUpperCase()}</span></div>` : ""}
+        <div style="margin-top:8px"><button id="btnShare" class="sec" style="padding:8px 12px">📤 Teilen</button> <span id="shareMsg" class="muted small"></span></div>
         <div class="muted small">In der Datenbank seit ${p.created_t ? fmtDate(p.created_t*1000) : "?"}</div>
       </div>
     </div>
@@ -158,6 +196,8 @@ async function show(code){
   <section class="card"><h2>📊 Nährwerte pro 100 g / ml</h2>${nutriTable(p.nutriments || {})}</section>
   <section class="card"><p class="muted small">Mogelpackung entdeckt? Du kannst sie bei der <a href="https://www.vzhh.de" target="_blank" rel="noopener">Verbraucherzentrale Hamburg</a> melden.</p></section>`;
 
+  $("#btnShare").onclick = () => shareProduct(code, name, p);
+  try{ history.replaceState(null, "", "#" + code); }catch(e){}
   $("#pDate").value = new Date().toISOString().slice(0,10);
   $("#pSave").onclick = () => {
     const price = parseFloat(($("#pPrice").value || "").replace(",", "."));
@@ -171,45 +211,61 @@ async function show(code){
   };
 
   window._seg = [];
-  const [seg, op] = await Promise.all([
-    quantityHistory(code, Math.min(Math.max(parseInt(p.rev, 10) || 0, 0), 5000), f => { const b = $("#bar"); if(b) b.style.width = (f*100) + "%"; }).catch(() => []),
+  const [h, op] = await Promise.all([
+    quantityHistory(code, p, f => { const b = $("#bar"); if(b) b.style.width = (f*100) + "%"; }).catch(() => ({seg:[], complete:false})),
     getPrices(code)
   ]);
-  window._seg = seg; window._opPrices = op;
-  renderHistory(seg, p, cur);
+  if(my !== showToken) return;
+  const seg = h.seg; window._seg = seg; window._opPrices = op;
+  renderHistory(h, p, cur);
   renderPrices(code, cur, seg, op);
 }
 
-function renderHistory(seg, p, cur){
+function renderHistory(h, p, cur){
+  const seg = h.seg;
+  window._share = null;
+  const warnIncomplete = h.complete ? "" : `<p class="muted small">⏳ Ein paar alte Versionen konnten gerade nicht geladen werden (Datenbank ausgelastet). Bitte später nochmal suchen.</p>`;
   if(!seg.length){
-    $("#hist").innerHTML = `<p>Füllmenge: <b>${esc(p.quantity || "unbekannt")}</b></p><p class="muted">Noch keine älteren Angaben in der Datenbank. Der Verlauf wächst, sobald das Produkt neu erfasst wird.</p>`;
+    $("#hist").innerHTML = `<p>Füllmenge: <b>${esc(p.quantity || "unbekannt")}</b></p><p class="muted">Noch keine älteren Angaben in der Datenbank. Der Verlauf wächst, sobald das Produkt neu erfasst wird.</p>` + warnIncomplete;
     return;
   }
-  let alerts = "";
+  const first = seg[0].p, last = seg[seg.length-1].p;
+  const same = (x, y) => x && y && x.unit === y.unit;
+  const anyDrop = seg.some((s, i) => i > 0 && same(seg[i-1].p, s.p) && s.p.amount < seg[i-1].p.amount);
+  let box;
+  if(same(first, last) && last.amount < first.amount){
+    const d = (last.amount - first.amount) / first.amount * 100;
+    const hidden = (first.amount / last.amount - 1) * 100;
+    const when = [...seg].reverse().find(s => s.p.amount === last.amount);
+    box = `<div class="alert">⚠️ <b>Weniger Inhalt:</b> von ${qtyText(first)} auf ${qtyText(last)} (${fmtPct(d)})${when && when.from ? ", seit ca. " + fmtDate(when.from) : ""}.<br>Bei gleichem Preis ist das eine versteckte Preiserhöhung von <b>${fmtPct(hidden)}</b>.</div>`;
+    window._share = `Füllmenge von ${qtyText(first)} auf ${qtyText(last)} geschrumpft (${fmtPct(d)}). Bei gleichem Preis = ${fmtPct(hidden)} teurer!`;
+  } else if(anyDrop){
+    const low = seg.filter(s => same(s.p, last)).reduce((m, s) => s.p.amount < m.p.amount ? s : m);
+    box = `<div class="alert" style="border-left-color:var(--yellow);background:rgba(250,204,21,.08)">🤔 <b>Unklar:</b> Zwischendurch war ${qtyText(low.p)} eingetragen, jetzt wieder ${qtyText(last)}. Das kann ein Eingabefehler in der Datenbank sein oder eine Sondergröße (z. B. Aktionsdose). Am besten im Laden auf der Packung nachsehen.</div>`;
+    window._share = `Füllmenge aktuell ${qtyText(last)} (zwischendurch ${qtyText(low.p)} eingetragen).`;
+  } else {
+    box = `<div class="ok">✅ Keine Verkleinerung gefunden.</div>`;
+    window._share = `Füllmenge ${qtyText(last)}, keine Verkleinerung gefunden.`;
+  }
   const items = seg.map((s, i) => {
     let badge = `<span class="badge b-gray">Start</span>`;
     if(i > 0){
       const prev = seg[i-1].p;
-      if(prev && s.p && prev.unit === s.p.unit && prev.amount !== s.p.amount){
+      if(same(prev, s.p)){
         const d = (s.p.amount - prev.amount) / prev.amount * 100;
         badge = `<span class="badge ${d < 0 ? "b-red" : "b-green"}">${fmtPct(d)}</span>`;
-        if(d < 0){
-          const hidden = (prev.amount / s.p.amount - 1) * 100;
-          alerts += `<div class="alert">⚠️ <b>Weniger Inhalt:</b> von ${qtyText(prev)} auf ${qtyText(s.p)} (${fmtPct(d)})${s.from ? ", ab ca. " + fmtDate(s.from) : ""}.<br>Bei gleichem Preis ist das eine versteckte Preiserhöhung von <b>${fmtPct(hidden)}</b>.</div>`;
-        }
       } else badge = `<span class="badge b-gray">geändert</span>`;
     }
-    return `<li><span>${s.from ? fmtDate(s.from) : "?"}</span><span><b>${esc(s.raw)}</b> ${badge}</span></li>`;
+    return `<li><span>${s.from ? fmtDate(s.from) : "?"}</span><span><b>${esc(qtyText(s.p))}</b> ${badge}</span></li>`;
   }).reverse().join("");
-  $("#hist").innerHTML = (alerts || `<div class="ok">✅ Keine Verkleinerung gefunden.</div>`) +
-    `<ul class="tl" style="margin-top:10px">${items}</ul>
-     <p class="muted small">Datum = wann die Angabe in der Datenbank geändert wurde (nicht unbedingt der Tag der Änderung im Laden). Verlauf erst ab Aufnahme in die Datenbank.</p>`;
+  $("#hist").innerHTML = box + `<ul class="tl" style="margin-top:10px">${items}</ul>` + warnIncomplete +
+    `<p class="muted small">Datum = wann die Angabe in der Datenbank geändert wurde (nicht unbedingt der Tag der Änderung im Laden). Verlauf erst ab Aufnahme in die Datenbank. Einträge ohne Einheit (z. B. „185“ oder „2pcs“) werden als Tippfehler ignoriert.</p>`;
 }
 
 function renderPrices(code, cur, seg, op){
   const own = arr2(load("own_" + code, [])).map((x, i) => ({...x, own:true, idx:i})).filter(x => +x.price > 0 && isFinite(x.date));
   const all = [...own, ...op].sort((a,b) => b.date - a.date);
-  if(!all.length){ $("#prices").innerHTML = `<p class="muted">Noch keine Preise bekannt. Trag den Preis aus dem Laden ein, dann entsteht dein eigener Verlauf.</p>`; return; }
+  if(!all.length){ window._lastPrice = null; $("#prices").innerHTML = `<p class="muted">Noch keine Preise bekannt. Trag den Preis aus dem Laden ein, dann entsteht dein eigener Verlauf.</p>`; return; }
   const rows = all.map(x => {
     const q = x.own && x.qty ? parseQty(x.qty) : qtyAt(seg, x.date, cur);
     x.gp = q ? x.price / q.amount * 1000 : null;
@@ -219,6 +275,7 @@ function renderPrices(code, cur, seg, op){
       <td class="r">${x.gp ? fmtEur(x.gp) + "/" + x.unit : "–"}</td>
       <td class="r">${x.own ? `<button class="sec" style="padding:4px 8px" data-del="${x.idx}">✕</button>` : ""}</td></tr>`;
   }).join("");
+  window._lastPrice = all[0] || null;
   let summary = "";
   const withGp = all.filter(x => x.gp);
   if(withGp.length >= 2){
@@ -238,6 +295,23 @@ function nutriTable(n){
     .filter(r => n[r[1]] !== undefined && n[r[1]] !== "")
     .map(r => `<tr><td>${r[0]}</td><td class="r">${(+n[r[1]]).toLocaleString("de-DE",{maximumFractionDigits:1})} ${r[2]}</td></tr>`).join("");
   return rows ? `<table>${rows}</table>` : `<p class="muted">Keine Nährwerte vorhanden.</p>`;
+}
+
+/* ---------- Teilen (WhatsApp, E-Mail usw. über das Teilen-Menü des Handys) ---------- */
+async function shareProduct(code, name, p){
+  const url = location.origin + location.pathname + "#" + code;
+  const lines = [`🔍 ${name}${p.brands ? " (" + String(p.brands).slice(0, 60) + ")" : ""}`];
+  if(window._share) lines.push(window._share);
+  const pr = window._lastPrice;
+  if(pr) lines.push(`Letzter Preis: ${fmtEur(pr.price)}${pr.gp ? " (" + fmtEur(pr.gp) + "/" + pr.unit + ")" : ""}`);
+  const text = lines.join("\n");
+  const msg = $("#shareMsg");
+  if(navigator.share){
+    try{ await navigator.share({title: "Mogel-Check: " + name, text, url}); return; }
+    catch(e){ if(e && e.name === "AbortError") return; }
+  }
+  try{ await navigator.clipboard.writeText(text + "\n" + url); msg.textContent = "In die Zwischenablage kopiert."; }
+  catch(e){ msg.innerHTML = `<a href="https://wa.me/?text=${encodeURIComponent(text + "\n" + url)}" target="_blank" rel="noopener">Per WhatsApp senden</a>`; }
 }
 
 /* ---------- Zuletzt angesehen ---------- */
@@ -278,3 +352,6 @@ $("#btnScan").onclick = toggleScan;
 $("#btnSearch").onclick = () => show($("#code").value);
 $("#code").addEventListener("keydown", e => { if(e.key === "Enter") show($("#code").value); });
 renderRecent();
+const openHash = () => { const m = location.hash.match(/^#(\d{8,14})$/); if(m && m[1] !== $("#code").value) show(m[1]); };
+window.addEventListener("hashchange", openHash);
+openHash();
